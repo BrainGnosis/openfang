@@ -897,7 +897,7 @@
           <!-- Agent detail modal with tabs (Info / Files / Config) -->
           <template x-if="showDetailModal && detailAgent">
             <div class="modal-overlay" @click.self="showDetailModal = false" @keydown.escape.window="showDetailModal = false">
-              <div class="modal" style="max-width:600px">
+              <div class="modal" style="max-width:700px">
                 <div class="modal-header">
                   <h3>
                     <span x-show="detailAgent.identity && detailAgent.identity.emoji" x-text="detailAgent.identity && detailAgent.identity.emoji" style="margin-right:6px"></span>
@@ -961,13 +961,13 @@
                     <!-- Fallback Model Chain -->
                     <div class="detail-row" style="align-items:flex-start">
                       <span class="detail-label">Fallbacks</span>
-                      <div style="flex:1">
+                      <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;margin-left:16px">
                         <template x-if="detailAgent._fallbacks && detailAgent._fallbacks.length > 0">
-                          <div>
+                          <div style="display:flex;flex-direction:column;gap:4px">
                             <template x-for="(fb, idx) in detailAgent._fallbacks" :key="idx">
-                              <div class="flex gap-1 items-center" style="margin-bottom:4px">
-                                <span class="badge" style="font-size:11px;font-family:var(--font-mono)" x-text="(idx+1) + '. ' + fb.provider + '/' + fb.model"></span>
-                                <button class="btn btn-ghost btn-sm" style="padding:1px 4px;font-size:10px;color:var(--danger)" @click="removeFallback(idx)">&times;</button>
+                              <div class="flex gap-1 items-center" style="min-width:0">
+                                <span class="badge" style="font-size:11px;font-family:var(--font-mono);word-break:break-all;white-space:normal" x-text="(idx+1) + '. ' + fb.provider + '/' + fb.model"></span>
+                                <button class="btn btn-ghost btn-sm" style="padding:1px 4px;font-size:10px;color:var(--danger);flex-shrink:0" @click="removeFallback(idx)">&times;</button>
                               </div>
                             </template>
                           </div>
@@ -976,10 +976,12 @@
                           <span class="text-dim" style="font-size:12px">None — add a fallback chain</span>
                         </template>
                         <template x-if="!editingFallback">
-                          <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px;margin-top:4px" @click="editingFallback = true; newFallbackValue = ''">+ Add</button>
+                          <div>
+                            <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" @click="editingFallback = true; newFallbackValue = ''">+ Add</button>
+                          </div>
                         </template>
                         <template x-if="editingFallback">
-                          <div class="flex gap-1 mt-1" style="align-items:center">
+                          <div class="flex gap-1" style="align-items:center">
                             <input class="form-input" style="width:220px;font-size:12px" x-model="newFallbackValue" placeholder="provider/model" @keydown.enter="addFallback()" @keydown.escape="editingFallback = false">
                             <button class="btn btn-primary btn-sm" @click="addFallback()" style="padding:2px 10px;font-size:11px">Add</button>
                             <button class="btn btn-ghost btn-sm" @click="editingFallback = false" style="padding:2px 8px;font-size:11px">Cancel</button>
