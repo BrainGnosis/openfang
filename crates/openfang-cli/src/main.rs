@@ -886,6 +886,14 @@ fn write_stdout_safe(msg: &str) {
 }
 
 fn main() {
+    // [braingnosis] Install ring as the default rustls CryptoProvider.
+    // Required because both ring and aws-lc-rs are compiled in (AWS SDK uses aws-lc-rs,
+    // tokio-tungstenite uses rustls). Without this, rustls 0.23 panics at runtime
+    // when it can't auto-detect which provider to use.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // Load ~/.openfang/.env into process environment (system env takes priority).
     dotenv::load_dotenv();
 
