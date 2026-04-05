@@ -61,6 +61,11 @@ rusqlite = { version = "0.31", features = ["bundled", "serde_json"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
+# AWS SDK (for Bedrock LLM driver)
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-smithy-types = "1"
+
 # HTTP client (for LLM drivers)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "gzip", "deflate", "brotli"] }
 

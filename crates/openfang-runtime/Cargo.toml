@@ -28,6 +28,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
 dashmap = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-bedrockruntime = { workspace = true }
+aws-smithy-types = { workspace = true }
 regex-lite = { workspace = true }
 rusqlite = { workspace = true }
 rmcp = { workspace = true }

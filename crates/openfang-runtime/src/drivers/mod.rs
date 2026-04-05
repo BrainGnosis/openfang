@@ -5,6 +5,7 @@
 //! Mistral, Fireworks, Ollama, vLLM, Chutes.ai, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
@@ -377,6 +378,19 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new_azure(api_key, base_url)));
     }
 
+    // AWS Bedrock — uses SigV4 via the official AWS SDK.
+    // Credentials resolved via AWS credential chain (env vars, profiles, IMDS).
+    // Region from AWS_REGION or AWS_DEFAULT_REGION, defaults to us-east-1.
+    if provider == "bedrock" || provider == "aws-bedrock" {
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| {
+                tracing::warn!("AWS_REGION not set, defaulting to us-east-1");
+                "us-east-1".into()
+            });
+        return Ok(Arc::new(bedrock::BedrockDriver::new(region)));
+    }
+
     // Vertex AI — uses Google Cloud OAuth with service account credentials.
     // Requires GOOGLE_APPLICATION_CREDENTIALS env var pointing to service account JSON,
     // and the service account must be activated via gcloud CLI.
@@ -486,7 +500,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     Err(LlmError::Api {
         status: 0,
         message: format!(
-            "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, groq, openrouter, \
+            "Unknown provider '{}'. Supported: anthropic, bedrock, gemini, openai, azure, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
              chutes, venice, nvidia, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",

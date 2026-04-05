@@ -872,7 +872,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             display_name: "AWS Bedrock".into(),
             api_key_env: "AWS_ACCESS_KEY_ID".into(),
             base_url: BEDROCK_BASE_URL.into(),
-            key_required: true,
+            key_required: false, // AWS credential chain handles auth (env vars, profiles, IMDS)
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
