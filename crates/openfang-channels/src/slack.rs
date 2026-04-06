@@ -274,6 +274,11 @@ impl SlackAdapter {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // [braingnosis] Guard against empty text — Slack rejects with "no_text"
+        if text.trim().is_empty() {
+            tracing::debug!("Skipping empty Slack message to {channel_id}");
+            return Ok(());
+        }
         let chunks = split_message(text, SLACK_MSG_LIMIT);
 
         for chunk in chunks {
@@ -702,9 +707,19 @@ impl ChannelAdapter for SlackAdapter {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // [braingnosis] platform_id is now user_id (for RBAC), resolve to channel_id for API
         let channel_id = self.resolve_channel_id(&user.platform_id).await;
+
+        // [braingnosis] DM channels (starting with 'D') don't support threading in Slack.
+        // Replies with thread_ts in a DM create a confusing sub-thread under each message.
+        // Instead, send as a flat reply so the conversation reads naturally.
+        let thread_ts = if channel_id.starts_with('D') {
+            None
+        } else {
+            Some(thread_id)
+        };
+
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(&channel_id, &text, Some(thread_id))
+                self.api_send_message(&channel_id, &text, thread_ts)
                     .await?;
             }
             // [braingnosis] File upload support via 3-step external upload flow
@@ -713,16 +728,16 @@ impl ChannelAdapter for SlackAdapter {
                 filename,
                 mime_type: _,
             } => {
-                self.api_upload_file(&channel_id, &data, &filename, Some(thread_id))
+                self.api_upload_file(&channel_id, &data, &filename, thread_ts)
                     .await?;
             }
             ChannelContent::File { url, filename } => {
                 let text = format!("[{filename}]({url})");
-                self.api_send_message(&channel_id, &text, Some(thread_id))
+                self.api_send_message(&channel_id, &text, thread_ts)
                     .await?;
             }
             _ => {
-                self.api_send_message(&channel_id, "(Unsupported content type)", Some(thread_id))
+                self.api_send_message(&channel_id, "(Unsupported content type)", thread_ts)
                     .await?;
             }
         }
@@ -1005,25 +1020,18 @@ async fn parse_slack_event(
         ChannelContent::Text(text.to_string())
     };
 
-    // [braingnosis] Extract thread_id: only set if the message is actually in a thread.
-    // For top-level messages (including DMs), thread_id is None so the bot replies
-    // as a new top-level message instead of creating a new thread under each message.
-    // In channels, we still thread replies under the original message using `ts`.
+    // Extract thread_id: threaded replies have `thread_ts`, top-level messages
+    // use their own `ts` so the reply will start a thread under the original.
+    // [braingnosis] DM flat-reply handling is done in send_in_thread() instead —
+    // the adapter strips thread_ts for DM channels (starts with 'D').
     let real_thread_ts = msg_data["thread_ts"]
         .as_str()
         .or_else(|| event["thread_ts"].as_str());
     let channel_type_raw = event["channel_type"].as_str().unwrap_or("");
     let is_dm = channel_type_raw == "im" || channel.starts_with('D');
-    let thread_id = if let Some(tts) = real_thread_ts {
-        // Message is in an existing thread — reply in the same thread
-        Some(tts.to_string())
-    } else if !is_dm {
-        // Top-level message in a channel — thread the reply under the original
-        Some(ts.to_string())
-    } else {
-        // Top-level DM — reply as a flat message (no threading)
-        None
-    };
+    let thread_id = real_thread_ts
+        .map(|s| s.to_string())
+        .or_else(|| Some(ts.to_string()));
 
     // Check if the bot was @-mentioned (for group_policy = "mention_only")
     let mut metadata = HashMap::new();
@@ -1031,7 +1039,7 @@ async fn parse_slack_event(
         metadata.insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
     }
 
-    // real_thread_ts already extracted above for thread_id logic.
+    // Determine the real thread_ts from the event (None for top-level messages).
 
     let mut explicitly_mentioned = false;
     if let Some(ref bid) = *bot_user_id.read().await {
@@ -1058,7 +1066,7 @@ async fn parse_slack_event(
         }
     }
 
-    // is_dm already computed above for thread_id logic.
+    // [braingnosis] is_group based on channel type, not hardcoded.
     let is_group = !is_dm;
 
     // [braingnosis] Store channel ID in metadata so send() can route replies correctly.
