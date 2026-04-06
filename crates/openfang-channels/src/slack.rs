@@ -1005,13 +1005,25 @@ async fn parse_slack_event(
         ChannelContent::Text(text.to_string())
     };
 
-    // Extract thread_id: threaded replies have `thread_ts`, top-level messages
-    // use their own `ts` so the reply will start a thread under the original.
-    let thread_id = msg_data["thread_ts"]
+    // [braingnosis] Extract thread_id: only set if the message is actually in a thread.
+    // For top-level messages (including DMs), thread_id is None so the bot replies
+    // as a new top-level message instead of creating a new thread under each message.
+    // In channels, we still thread replies under the original message using `ts`.
+    let real_thread_ts = msg_data["thread_ts"]
         .as_str()
-        .or_else(|| event["thread_ts"].as_str())
-        .map(|s| s.to_string())
-        .or_else(|| Some(ts.to_string()));
+        .or_else(|| event["thread_ts"].as_str());
+    let channel_type_raw = event["channel_type"].as_str().unwrap_or("");
+    let is_dm = channel_type_raw == "im" || channel.starts_with('D');
+    let thread_id = if let Some(tts) = real_thread_ts {
+        // Message is in an existing thread — reply in the same thread
+        Some(tts.to_string())
+    } else if !is_dm {
+        // Top-level message in a channel — thread the reply under the original
+        Some(ts.to_string())
+    } else {
+        // Top-level DM — reply as a flat message (no threading)
+        None
+    };
 
     // Check if the bot was @-mentioned (for group_policy = "mention_only")
     let mut metadata = HashMap::new();
@@ -1019,10 +1031,7 @@ async fn parse_slack_event(
         metadata.insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
     }
 
-    // Determine the real thread_ts from the event (None for top-level messages).
-    let real_thread_ts = msg_data["thread_ts"]
-        .as_str()
-        .or_else(|| event["thread_ts"].as_str());
+    // real_thread_ts already extracted above for thread_id logic.
 
     let mut explicitly_mentioned = false;
     if let Some(ref bid) = *bot_user_id.read().await {
@@ -1049,10 +1058,8 @@ async fn parse_slack_event(
         }
     }
 
-    // Determine if this is a DM (not a group conversation).
-    // Slack DM channel IDs start with "D", and channel_type "im" in the event payload.
-    let channel_type = event["channel_type"].as_str().unwrap_or("");
-    let is_group = channel_type != "im" && !channel.starts_with('D');
+    // is_dm already computed above for thread_id logic.
+    let is_group = !is_dm;
 
     // [braingnosis] Store channel ID in metadata so send() can route replies correctly.
     // platform_id is now user_id (for RBAC), but we still need the channel for API calls.

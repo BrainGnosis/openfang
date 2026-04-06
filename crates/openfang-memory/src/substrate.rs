@@ -172,6 +172,15 @@ impl MemorySubstrate {
         self.structured.list_kv(agent_id)
     }
 
+    /// List KV pairs for an agent, optionally filtered by key prefix.
+    pub fn list_kv_prefix(
+        &self,
+        agent_id: AgentId,
+        prefix: Option<&str>,
+    ) -> OpenFangResult<Vec<(String, serde_json::Value)>> {
+        self.structured.list_kv_prefix(agent_id, prefix)
+    }
+
     /// Delete a KV entry for an agent.
     pub fn structured_delete(&self, agent_id: AgentId, key: &str) -> OpenFangResult<()> {
         self.structured.delete(agent_id, key)

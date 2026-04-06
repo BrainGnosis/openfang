@@ -80,7 +80,7 @@ impl SetupWizard {
                 "memory" => {
                     caps.memory_read.push("*".to_string());
                     caps.memory_write.push("*".to_string());
-                    for t in &["memory_store", "memory_recall"] {
+                    for t in &["memory_store", "memory_recall", "memory_list"] {
                         let s = t.to_string();
                         if !caps.tools.contains(&s) {
                             caps.tools.push(s);
@@ -241,7 +241,7 @@ impl SetupWizard {
         }
         if has("memory_store") {
             hints.push(
-                "- Use memory_store/memory_recall to persist and retrieve important context.",
+                "- Use memory_store/memory_recall/memory_list to persist, retrieve, and list context. Use memory_list with a prefix to find keys matching a pattern.",
             );
         }
 

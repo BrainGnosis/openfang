@@ -300,6 +300,7 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "memory_list" => tool_memory_list(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -711,6 +712,16 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The storage key to recall" }
                 },
                 "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_list".to_string(),
+            description: "List keys in shared memory. Optionally filter by prefix (e.g. 'shared.activity.' returns all activity entries). Returns keys and values.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prefix": { "type": "string", "description": "Optional key prefix filter (e.g. 'shared.activity.2026-04-06' to find all activity entries for a date). Omit to list all keys." }
+                }
             }),
         },
         // --- Collaboration tools ---
@@ -1716,6 +1727,26 @@ fn tool_memory_recall(
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+fn tool_memory_list(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let prefix = input["prefix"].as_str();
+    let pairs = kh.memory_list_keys(prefix)?;
+    if pairs.is_empty() {
+        return Ok(match prefix {
+            Some(pfx) => format!("No keys found matching prefix '{pfx}'."),
+            None => "No keys in shared memory.".to_string(),
+        });
+    }
+    let result: serde_json::Value = pairs
+        .into_iter()
+        .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+        .collect();
+    serde_json::to_string_pretty(&result).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "browser_navigate" => Some("browser_navigate"),
         "memory_search" | "memory_recall" => Some("memory_recall"),
         "memory_save" | "memory_store" => Some("memory_store"),
+        "memory_list" | "memory_keys" | "memory_list_keys" => Some("memory_list"),
         "sessions_send" | "agent_message" => Some("agent_send"),
         "sessions_list" | "agents_list" | "agent_list" => Some("agent_list"),
         "sessions_spawn" => Some("agent_send"),

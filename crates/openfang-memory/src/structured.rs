@@ -79,6 +79,62 @@ impl StructuredStore {
         Ok(())
     }
 
+    /// List keys matching an optional prefix for an agent.
+    ///
+    /// When `prefix` is `Some("shared.activity.")`, returns only keys that
+    /// start with that string. When `None`, returns all keys (same as `list_kv`).
+    /// Returns `(key, value)` pairs sorted by key.
+    pub fn list_kv_prefix(
+        &self,
+        agent_id: AgentId,
+        prefix: Option<&str>,
+    ) -> OpenFangResult<Vec<(String, serde_json::Value)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match prefix {
+            Some(pfx) => (
+                "SELECT key, value FROM kv_store WHERE agent_id = ?1 AND key LIKE ?2 ORDER BY key"
+                    .to_string(),
+                vec![
+                    Box::new(agent_id.0.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(format!("{pfx}%")),
+                ],
+            ),
+            None => (
+                "SELECT key, value FROM kv_store WHERE agent_id = ?1 ORDER BY key".to_string(),
+                vec![Box::new(agent_id.0.to_string()) as Box<dyn rusqlite::types::ToSql>],
+            ),
+        };
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let key: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((key, blob))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut pairs = Vec::new();
+        for row in rows {
+            let (key, blob) = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or_else(|_| {
+                String::from_utf8(blob)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null)
+            });
+            pairs.push((key, value));
+        }
+        Ok(pairs)
+    }
+
     /// List all key-value pairs for an agent.
     pub fn list_kv(&self, agent_id: AgentId) -> OpenFangResult<Vec<(String, serde_json::Value)>> {
         let conn = self
