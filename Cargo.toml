@@ -62,7 +62,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # AWS SDK (for Bedrock LLM driver)
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
 aws-smithy-types = "1"
 
