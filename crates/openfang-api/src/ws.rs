@@ -23,6 +23,7 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::llm_driver::StreamEvent;
 use openfang_runtime::llm_errors;
 use openfang_types::agent::AgentId;
+use openfang_types::commands::{self, Surfaces};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -145,11 +146,27 @@ pub async fn agent_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    // Trim whitespace so empty/whitespace-only api_key disables auth.
+    // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
+    // Trim whitespace so empty/whitespace-only api_key still triggers the
+    // fail-closed path for non-loopback origins (see issue #1034 B2).
     let api_key_raw = &state.kernel.config.api_key;
     let api_key = api_key_raw.trim();
-    if !api_key.is_empty() {
+    let is_loopback = addr.ip().is_loopback();
+
+    if api_key.is_empty() {
+        // No key configured. Only allow loopback, unless the operator has
+        // explicitly opted in to running open via OPENFANG_ALLOW_NO_AUTH=1.
+        let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        if !is_loopback && !allow_no_auth {
+            warn!(
+                ip = %addr.ip(),
+                "WebSocket upgrade rejected: no api_key configured and origin is not loopback"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    } else {
         // SECURITY: Use constant-time comparison to prevent timing attacks on API key
         let ct_eq = |token: &str, key: &str| -> bool {
             use subtle::ConstantTimeEq;
@@ -169,7 +186,7 @@ pub async fn agent_ws(
         let query_auth = uri
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|raw| crate::percent_decode(raw))
+            .map(crate::percent_decode)
             .map(|token| ct_eq(&token, api_key))
             .unwrap_or(false);
 
@@ -837,8 +854,17 @@ async fn handle_command(
     args: &str,
     verbose: &Arc<AtomicU8>,
 ) -> serde_json::Value {
-    match cmd {
-        "new" | "reset" => match state.kernel.reset_session(agent_id) {
+    // Canonicalise through the unified command registry. This resolves aliases
+    // (e.g. `reset` -> `new`) and is case-insensitive. If the command is not
+    // registered on the WEB surface, fall through to the existing match so any
+    // legacy/un-registered handlers still work byte-identically.
+    let canonical: &str = commands::resolve(cmd)
+        .filter(|def| def.surfaces.contains(Surfaces::WEB))
+        .map(|def| def.name)
+        .unwrap_or(cmd);
+
+    match canonical {
+        "new" => match state.kernel.reset_session(agent_id) {
             Ok(()) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": "Session reset. Chat history cleared."})
             }
@@ -1007,7 +1033,20 @@ async fn handle_command(
             };
             serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
         }
-        _ => serde_json::json!({"type": "error", "content": format!("Unknown command: {cmd}")}),
+        "help" => {
+            serde_json::json!({
+                "type": "command_result",
+                "command": cmd,
+                "message": commands::render_help(Surfaces::WEB),
+            })
+        }
+        _ => serde_json::json!({
+            "type": "error",
+            "content": format!(
+                "Unknown command: /{cmd}\n\n{}",
+                commands::render_help(Surfaces::WEB)
+            ),
+        }),
     }
 }
 

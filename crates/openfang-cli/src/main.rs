@@ -440,6 +440,27 @@ enum HandCommands {
         /// Instance ID (from `hand active`).
         id: String,
     },
+    /// Get, set, or list settings for an active hand instance.
+    ///
+    /// With no flags, prints the current settings. Use `--set KEY=VAL`
+    /// (repeatable) to update values, `--unset KEY` to remove a value,
+    /// or `--get KEY` to print a single value.
+    Config {
+        /// Hand ID (e.g. "browser", "clip").
+        id: String,
+        /// Print a single setting value.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["set", "unset", "list"])]
+        get: Option<String>,
+        /// Set a setting value. Format: `KEY=VALUE`. May be repeated.
+        #[arg(long, value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Unset a setting key. May be repeated.
+        #[arg(long, value_name = "KEY")]
+        unset: Vec<String>,
+        /// List the current settings (default when no other flag is given).
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1010,6 +1031,13 @@ fn main() {
             HandCommands::InstallDeps { id } => cmd_hand_install_deps(&id),
             HandCommands::Pause { id } => cmd_hand_pause(&id),
             HandCommands::Resume { id } => cmd_hand_resume(&id),
+            HandCommands::Config {
+                id,
+                get,
+                set,
+                unset,
+                list,
+            } => cmd_hand_config(&id, get.as_deref(), &set, &unset, list),
         },
         Some(Commands::Config(sub)) => match sub {
             ConfigCommands::Show => cmd_config_show(),
@@ -2466,7 +2494,9 @@ decay_rate = 0.05
             if !json {
                 ui::check_ok("GitHub Copilot (authenticated via device flow)");
             }
-            checks.push(serde_json::json!({"check": "provider", "name": "GitHub Copilot", "status": "ok"}));
+            checks.push(
+                serde_json::json!({"check": "provider", "name": "GitHub Copilot", "status": "ok"}),
+            );
         }
     }
 
@@ -4563,6 +4593,167 @@ fn cmd_hand_resume(id: &str) {
     }
 }
 
+/// Parse a `KEY=VALUE` pair passed to `--set`.
+///
+/// Empty keys are rejected so `--set =foo` or `--set  =bar` surface a clear
+/// error rather than silently writing a blank setting name.
+fn parse_hand_config_pair(pair: &str) -> Result<(String, String), String> {
+    let (key, value) = pair
+        .split_once('=')
+        .ok_or_else(|| format!("Invalid --set '{pair}': expected KEY=VALUE"))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!("Invalid --set '{pair}': empty key"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn cmd_hand_config(
+    id: &str,
+    get: Option<&str>,
+    set_pairs: &[String],
+    unset_keys: &[String],
+    list: bool,
+) {
+    let base = require_daemon("hand config");
+    let client = daemon_client();
+
+    // Always fetch current state first so we can merge updates and print
+    // a useful view even when the target hand has no active instance.
+    let url = format!("{base}/api/hands/{id}/settings");
+    let body = daemon_json(client.get(&url).send());
+
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        ui::error(&format!("Hand '{id}': {err}"));
+        std::process::exit(1);
+    }
+
+    let mut current: std::collections::BTreeMap<String, serde_json::Value> = body
+        .get("current_values")
+        .and_then(|v| v.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
+    let schema_defaults: std::collections::BTreeMap<String, String> = body
+        .get("settings")
+        .and_then(|v| v.get("settings"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let key = s.get("key").and_then(|v| v.as_str())?.to_string();
+                    let default = s
+                        .get("default")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((key, default))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Pure read paths — no mutation, no daemon round-trip beyond the GET.
+    if let Some(key) = get {
+        match current
+            .get(key)
+            .map(value_to_display)
+            .or_else(|| schema_defaults.get(key).cloned())
+        {
+            Some(val) => println!("{val}"),
+            None => {
+                ui::error(&format!("No setting '{key}' on hand '{id}'"));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let is_mutation = !set_pairs.is_empty() || !unset_keys.is_empty();
+    if !is_mutation {
+        print_hand_config(id, &current, &schema_defaults, list);
+        return;
+    }
+
+    for pair in set_pairs {
+        match parse_hand_config_pair(pair) {
+            Ok((k, v)) => {
+                current.insert(k, serde_json::Value::String(v));
+            }
+            Err(e) => {
+                ui::error(&e);
+                std::process::exit(1);
+            }
+        }
+    }
+    for key in unset_keys {
+        let key = key.trim();
+        if key.is_empty() {
+            ui::error("Invalid --unset: empty key");
+            std::process::exit(1);
+        }
+        current.remove(key);
+    }
+
+    let payload: serde_json::Map<String, serde_json::Value> = current.clone().into_iter().collect();
+    let resp = daemon_json(
+        client
+            .put(&url)
+            .json(&serde_json::Value::Object(payload))
+            .send(),
+    );
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        ui::error(&format!("Failed to update hand '{id}' settings: {err}"));
+        if err.contains("No active instance") {
+            ui::hint(&format!(
+                "Activate the hand first: openfang hand activate {id}"
+            ));
+        }
+        std::process::exit(1);
+    }
+    ui::success(&format!("Updated settings for hand '{id}'."));
+    print_hand_config(id, &current, &schema_defaults, true);
+}
+
+/// Human-readable display for a JSON setting value.
+fn value_to_display(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn print_hand_config(
+    id: &str,
+    current: &std::collections::BTreeMap<String, serde_json::Value>,
+    schema_defaults: &std::collections::BTreeMap<String, String>,
+    _list: bool,
+) {
+    if current.is_empty() && schema_defaults.is_empty() {
+        println!("No settings configured for hand '{id}'.");
+        return;
+    }
+
+    println!("Settings for hand '{id}':");
+    let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for k in current.keys() {
+        keys.insert(k.as_str());
+    }
+    for k in schema_defaults.keys() {
+        keys.insert(k.as_str());
+    }
+    for key in keys {
+        match current.get(key) {
+            Some(v) => println!("  {key} = {}", value_to_display(v)),
+            None => {
+                let default = schema_defaults.get(key).map(|s| s.as_str()).unwrap_or("");
+                println!("  {key} = {default}  (default)");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider / API key helpers
 // ---------------------------------------------------------------------------
@@ -4749,6 +4940,38 @@ fn cmd_config_edit() {
     }
 }
 
+/// Outcome of looking up a dotted key path in a parsed TOML config.
+#[derive(Debug, PartialEq)]
+enum ConfigGetOutcome {
+    /// Scalar value formatted for display (may be the empty string).
+    Value(String),
+    /// Key exists but resolves to a non-scalar (table or array).
+    NonScalar,
+    /// Key path does not exist.
+    NotFound,
+}
+
+/// Look up a dotted key path inside a parsed TOML document and format the
+/// resulting scalar for display. Pure function so the behaviour can be tested
+/// without touching the filesystem.
+fn lookup_config_value(table: &toml::Value, key: &str) -> ConfigGetOutcome {
+    let mut current = table;
+    for part in key.split('.') {
+        match current.get(part) {
+            Some(v) => current = v,
+            None => return ConfigGetOutcome::NotFound,
+        }
+    }
+    match current {
+        toml::Value::String(s) => ConfigGetOutcome::Value(s.clone()),
+        toml::Value::Integer(i) => ConfigGetOutcome::Value(i.to_string()),
+        toml::Value::Float(f) => ConfigGetOutcome::Value(f.to_string()),
+        toml::Value::Boolean(b) => ConfigGetOutcome::Value(b.to_string()),
+        toml::Value::Datetime(d) => ConfigGetOutcome::Value(d.to_string()),
+        toml::Value::Array(_) | toml::Value::Table(_) => ConfigGetOutcome::NonScalar,
+    }
+}
+
 fn cmd_config_get(key: &str) {
     let home = openfang_home();
     let config_path = home.join("config.toml");
@@ -4771,25 +4994,19 @@ fn cmd_config_get(key: &str) {
         std::process::exit(1);
     });
 
-    // Navigate dotted path
-    let mut current = &table;
-    for part in key.split('.') {
-        match current.get(part) {
-            Some(v) => current = v,
-            None => {
-                ui::error(&format!("Key not found: {key}"));
-                std::process::exit(1);
-            }
+    match lookup_config_value(&table, key) {
+        ConfigGetOutcome::Value(s) => println!("{s}"),
+        ConfigGetOutcome::NonScalar => {
+            ui::error_with_fix(
+                &format!("'{key}' is a section, not a scalar value"),
+                "Use a deeper dotted key (e.g. `section.field`)",
+            );
+            std::process::exit(1);
         }
-    }
-
-    // Print value
-    match current {
-        toml::Value::String(s) => println!("{s}"),
-        toml::Value::Integer(i) => println!("{i}"),
-        toml::Value::Float(f) => println!("{f}"),
-        toml::Value::Boolean(b) => println!("{b}"),
-        other => println!("{other}"),
+        ConfigGetOutcome::NotFound => {
+            ui::error(&format!("Key not found: {key}"));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -4992,7 +5209,9 @@ fn cmd_config_set_key(provider: &str) {
             ui::error(&format!("Failed to create async runtime: {e}"));
             std::process::exit(1);
         });
-        match rt.block_on(openfang_runtime::drivers::copilot::run_interactive_setup(&openfang_dir)) {
+        match rt.block_on(openfang_runtime::drivers::copilot::run_interactive_setup(
+            &openfang_dir,
+        )) {
             Ok(_) => {
                 ui::success("GitHub Copilot configured successfully");
                 ui::hint("Restart the daemon: openfang stop && openfang start");
@@ -7021,7 +7240,182 @@ args = ["-y", "@modelcontextprotocol/server-github"]
         assert_eq!(events.len(), 4);
     }
 
+    // --- Config get command unit tests ---
+
+    fn sample_config_with_base_url() -> &'static str {
+        r#"api_listen = "127.0.0.1:4200"
+
+[default_model]
+provider = "openai"
+model = "qwen3-coder-30b/qwen3-coder-30b"
+api_key_env = "OPENAI_API_KEY"
+base_url = "http://localhost:8991/v1"
+api_key = "sk-bf-test"
+
+[memory]
+decay_rate = 0.05
+"#
+    }
+
+    fn lookup(toml_str: &str, key: &str) -> super::ConfigGetOutcome {
+        let table: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        super::lookup_config_value(&table, key)
+    }
+
+    // Regression test for issue #905: `config get default_model.base_url`
+    // must return the configured base_url string, not an empty string.
+    #[test]
+    fn config_get_returns_default_model_base_url() {
+        let out = lookup(sample_config_with_base_url(), "default_model.base_url");
+        assert_eq!(
+            out,
+            super::ConfigGetOutcome::Value("http://localhost:8991/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn config_get_returns_each_default_model_scalar() {
+        let cfg = sample_config_with_base_url();
+        assert_eq!(
+            lookup(cfg, "default_model.provider"),
+            super::ConfigGetOutcome::Value("openai".to_string())
+        );
+        assert_eq!(
+            lookup(cfg, "default_model.model"),
+            super::ConfigGetOutcome::Value("qwen3-coder-30b/qwen3-coder-30b".to_string())
+        );
+        assert_eq!(
+            lookup(cfg, "default_model.api_key_env"),
+            super::ConfigGetOutcome::Value("OPENAI_API_KEY".to_string())
+        );
+        assert_eq!(
+            lookup(cfg, "default_model.api_key"),
+            super::ConfigGetOutcome::Value("sk-bf-test".to_string())
+        );
+    }
+
+    #[test]
+    fn config_get_top_level_scalar() {
+        assert_eq!(
+            lookup(sample_config_with_base_url(), "api_listen"),
+            super::ConfigGetOutcome::Value("127.0.0.1:4200".to_string())
+        );
+    }
+
+    #[test]
+    fn config_get_unset_base_url_is_not_found() {
+        let cfg = r#"
+[default_model]
+provider = "openai"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+"#;
+        assert_eq!(
+            lookup(cfg, "default_model.base_url"),
+            super::ConfigGetOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn config_get_explicit_empty_string_round_trips_as_empty() {
+        let cfg = r#"
+[default_model]
+provider = "openai"
+base_url = ""
+"#;
+        assert_eq!(
+            lookup(cfg, "default_model.base_url"),
+            super::ConfigGetOutcome::Value(String::new())
+        );
+    }
+
+    #[test]
+    fn config_get_missing_key_returns_not_found() {
+        assert_eq!(
+            lookup(sample_config_with_base_url(), "default_model.nope"),
+            super::ConfigGetOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn config_get_section_reports_non_scalar() {
+        assert_eq!(
+            lookup(sample_config_with_base_url(), "default_model"),
+            super::ConfigGetOutcome::NonScalar
+        );
+    }
+
+    #[test]
+    fn config_get_numeric_and_boolean_scalars() {
+        let cfg = r#"
+retries = 3
+ratio = 0.25
+enabled = true
+"#;
+        assert_eq!(
+            lookup(cfg, "retries"),
+            super::ConfigGetOutcome::Value("3".to_string())
+        );
+        assert_eq!(
+            lookup(cfg, "ratio"),
+            super::ConfigGetOutcome::Value("0.25".to_string())
+        );
+        assert_eq!(
+            lookup(cfg, "enabled"),
+            super::ConfigGetOutcome::Value("true".to_string())
+        );
+    }
+
     // --- Uninstall command unit tests ---
+
+    // --- hand config command unit tests ---
+
+    #[test]
+    fn test_hand_config_parse_pair_ok() {
+        let (k, v) = super::parse_hand_config_pair("headless=true").unwrap();
+        assert_eq!(k, "headless");
+        assert_eq!(v, "true");
+    }
+
+    #[test]
+    fn test_hand_config_parse_pair_value_may_contain_equals() {
+        let (k, v) = super::parse_hand_config_pair("url=https://example.com?a=b").unwrap();
+        assert_eq!(k, "url");
+        assert_eq!(v, "https://example.com?a=b");
+    }
+
+    #[test]
+    fn test_hand_config_parse_pair_value_may_be_empty() {
+        // Empty values are valid (useful to explicitly blank a setting before
+        // PUT). Empty keys are the failure case.
+        let (k, v) = super::parse_hand_config_pair("foo=").unwrap();
+        assert_eq!(k, "foo");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn test_hand_config_parse_pair_rejects_empty_key() {
+        assert!(super::parse_hand_config_pair("=bar").is_err());
+        assert!(super::parse_hand_config_pair("   =bar").is_err());
+    }
+
+    #[test]
+    fn test_hand_config_parse_pair_requires_equals() {
+        assert!(super::parse_hand_config_pair("headless").is_err());
+    }
+
+    #[test]
+    fn test_hand_config_parse_multiple_pairs_round_trip() {
+        let inputs = ["a=1", "b=two", "c=http://x.y"];
+        let mut map = std::collections::BTreeMap::new();
+        for pair in inputs {
+            let (k, v) = super::parse_hand_config_pair(pair).unwrap();
+            map.insert(k, v);
+        }
+        assert_eq!(map.get("a"), Some(&"1".to_string()));
+        assert_eq!(map.get("b"), Some(&"two".to_string()));
+        assert_eq!(map.get("c"), Some(&"http://x.y".to_string()));
+    }
 
     #[test]
     fn test_uninstall_path_line_filter() {

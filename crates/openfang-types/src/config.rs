@@ -52,6 +52,30 @@ pub enum GroupPolicy {
     Ignore,
 }
 
+/// Prefix style applied to outbound agent messages on a channel.
+///
+/// When enabled, the channel bridge wraps the responding agent's reply with its
+/// name so end-users can tell which agent authored the message when multiple
+/// agents share the same channel. Default is `Off` to preserve existing
+/// behavior.
+///
+/// Platform-native identity (e.g. Slack per-message bot username override,
+/// Discord embed author field) is intentionally out of scope here and will be
+/// addressed in a follow-up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixStyle {
+    /// No prefix — byte-identical to pre-feature behavior.
+    #[default]
+    Off,
+    /// Plain bracketed name: `[agent-name] text`.
+    Bracket,
+    /// Bold bracketed name via markdown: `**[agent-name]** text`.
+    /// Renders bold on platforms that support markdown (Discord, Telegram
+    /// markdown mode, Slack mrkdwn treats it as bold too).
+    BoldBracket,
+}
+
 /// Output format hint for channel-specific message formatting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +117,12 @@ pub struct ChannelOverrides {
     /// Defaults to true. Set to false to suppress automatic reactions (e.g. on Telegram).
     #[serde(default = "default_true")]
     pub lifecycle_reactions: bool,
+    /// Prefix outbound messages with the responding agent's name.
+    ///
+    /// Defaults to `PrefixStyle::Off` so enabling this feature is opt-in per
+    /// channel and existing configs keep their current output byte-for-byte.
+    #[serde(default)]
+    pub prefix_agent_name: PrefixStyle,
 }
 
 impl Default for ChannelOverrides {
@@ -108,6 +138,7 @@ impl Default for ChannelOverrides {
             usage_footer: None,
             typing_mode: None,
             lifecycle_reactions: true,
+            prefix_agent_name: PrefixStyle::Off,
         }
     }
 }
@@ -1130,6 +1161,22 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
+    ///
+    /// When a skill declares a `config:` section in its SKILL.md frontmatter,
+    /// the loader resolves each variable via:
+    /// 1. this map (outer key = skill name, inner key = var name),
+    /// 2. env var named by the var's `env` field,
+    /// 3. the var's `default`.
+    ///
+    /// Example `~/.openfang/config.toml`:
+    /// ```toml
+    /// [skills.github-repo-helper]
+    /// github_token = "ghp_..."
+    /// default_branch = "develop"
+    /// ```
+    #[serde(default)]
+    pub skills: HashMap<String, HashMap<String, String>>,
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1367,6 +1414,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            skills: HashMap::new(),
         }
     }
 }
@@ -1485,6 +1533,7 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} mapping(s)", self.provider_api_keys.len()),
             )
             .field("auth", &format!("enabled={}", self.auth.enabled))
+            .field("skills", &format!("{} skill config(s)", self.skills.len()))
             .finish()
     }
 }
