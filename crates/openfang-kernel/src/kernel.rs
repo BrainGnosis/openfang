@@ -2311,6 +2311,7 @@ impl OpenFangKernel {
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                ..Default::default()
             },
             iterations: 1,
             cost_usd: None,
@@ -2371,6 +2372,7 @@ impl OpenFangKernel {
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                ..Default::default()
             },
             cost_usd: None,
             iterations: 1,

@@ -222,12 +222,27 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     /// Tokens generated in the output.
     pub output_tokens: u64,
+    /// Anthropic prompt-cache: tokens written to cache on this call
+    /// (~1.25× input price; count toward ITPM).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Anthropic prompt-cache: tokens read from cache on this call
+    /// (~0.1× input price; do NOT count toward Sonnet 4.x ITPM).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
 impl TokenUsage {
-    /// Total tokens used.
+    /// Total tokens used (input + output). Cache tokens are additive and
+    /// excluded so this stays comparable across cached/uncached calls.
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Total input-side tokens actually processed this call, including
+    /// cache reads/writes. Useful for telemetry / cost breakdowns.
+    pub fn total_input_with_cache(&self) -> u64 {
+        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
     }
 }
 
@@ -266,6 +281,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         };
         assert_eq!(usage.total(), 150);
     }

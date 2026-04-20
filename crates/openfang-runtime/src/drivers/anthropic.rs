@@ -9,7 +9,7 @@ use futures::StreamExt;
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
-use openfang_types::tool::ToolCall;
+use openfang_types::tool::{ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -40,8 +40,11 @@ impl AnthropicDriver {
 struct ApiRequest {
     model: String,
     max_tokens: u32,
+    /// System prompt as structured blocks so we can attach
+    /// `cache_control` for prompt caching. `None` when the caller
+    /// provides no system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<SystemBlock>>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool>,
@@ -49,6 +52,29 @@ struct ApiRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+/// A system prompt block. We only emit `type: "text"`.
+#[derive(Debug, Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// `cache_control` marker. Anthropic currently only accepts `"ephemeral"`.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+impl CacheControl {
+    const EPHEMERAL: Self = Self {
+        cache_type: "ephemeral",
+    };
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +125,9 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// Set on the LAST tool only to cache the whole tool array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 /// Anthropic Messages API response body.
@@ -128,6 +157,10 @@ enum ResponseContentBlock {
 struct ApiUsage {
     input_tokens: u64,
     output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 /// Anthropic API error response.
@@ -156,7 +189,7 @@ enum ContentBlockAccum {
 impl LlmDriver for AnthropicDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         // Extract system prompt from messages or use the provided one
-        let system = request.system.clone().or_else(|| {
+        let system_text = request.system.clone().or_else(|| {
             request.messages.iter().find_map(|m| {
                 if m.role == Role::System {
                     match &m.content {
@@ -168,6 +201,9 @@ impl LlmDriver for AnthropicDriver {
                 }
             })
         });
+        // Wrap system as a single cache-marked text block so stable
+        // prefixes are served from Anthropic's prompt cache.
+        let system = build_system_blocks(system_text);
 
         // Build API messages, filtering out system messages
         let api_messages: Vec<ApiMessage> = request
@@ -177,16 +213,8 @@ impl LlmDriver for AnthropicDriver {
             .map(convert_message)
             .collect();
 
-        // Build tools
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
+        // Build tools; cache_control on the LAST tool caches the whole array.
+        let api_tools = build_tools_with_cache(&request.tools);
 
         let api_request = ApiRequest {
             model: request.model.clone(),
@@ -218,19 +246,20 @@ impl LlmDriver for AnthropicDriver {
             let status = resp.status().as_u16();
 
             if status == 429 || status == 529 {
+                // Prefer server-signaled backoff over guessing.
+                let retry_ms = retry_after_ms(&resp, attempt);
                 if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
                     warn!(status, retry_ms, "Rate limited, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
                     continue;
                 }
                 return Err(if status == 429 {
                     LlmError::RateLimited {
-                        retry_after_ms: 5000,
+                        retry_after_ms: retry_ms,
                     }
                 } else {
                     LlmError::Overloaded {
-                        retry_after_ms: 5000,
+                        retry_after_ms: retry_ms,
                     }
                 });
             }
@@ -265,7 +294,7 @@ impl LlmDriver for AnthropicDriver {
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
         // Build request (same as complete but with stream: true)
-        let system = request.system.clone().or_else(|| {
+        let system_text = request.system.clone().or_else(|| {
             request.messages.iter().find_map(|m| {
                 if m.role == Role::System {
                     match &m.content {
@@ -277,6 +306,7 @@ impl LlmDriver for AnthropicDriver {
                 }
             })
         });
+        let system = build_system_blocks(system_text);
 
         let api_messages: Vec<ApiMessage> = request
             .messages
@@ -285,15 +315,7 @@ impl LlmDriver for AnthropicDriver {
             .map(convert_message)
             .collect();
 
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
+        let api_tools = build_tools_with_cache(&request.tools);
 
         let api_request = ApiRequest {
             model: request.model.clone(),
@@ -325,19 +347,19 @@ impl LlmDriver for AnthropicDriver {
             let status = resp.status().as_u16();
 
             if status == 429 || status == 529 {
+                let retry_ms = retry_after_ms(&resp, attempt);
                 if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
                     warn!(status, retry_ms, "Rate limited (stream), retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
                     continue;
                 }
                 return Err(if status == 429 {
                     LlmError::RateLimited {
-                        retry_after_ms: 5000,
+                        retry_after_ms: retry_ms,
                     }
                 } else {
                     LlmError::Overloaded {
-                        retry_after_ms: 5000,
+                        retry_after_ms: retry_ms,
                     }
                 });
             }
@@ -386,8 +408,15 @@ impl LlmDriver for AnthropicDriver {
 
                     match event_type.as_str() {
                         "message_start" => {
-                            if let Some(it) = json["message"]["usage"]["input_tokens"].as_u64() {
+                            let u = &json["message"]["usage"];
+                            if let Some(it) = u["input_tokens"].as_u64() {
                                 usage.input_tokens = it;
+                            }
+                            if let Some(cc) = u["cache_creation_input_tokens"].as_u64() {
+                                usage.cache_creation_input_tokens = cc;
+                            }
+                            if let Some(cr) = u["cache_read_input_tokens"].as_u64() {
+                                usage.cache_read_input_tokens = cr;
                             }
                         }
                         "content_block_start" => {
@@ -552,6 +581,54 @@ impl LlmDriver for AnthropicDriver {
     }
 }
 
+/// Compute retry delay for 429/529 responses. Uses the `retry-after`
+/// response header when present (Anthropic sends integer seconds);
+/// otherwise falls back to linear backoff based on attempt count.
+/// Capped at 60s to avoid absurd waits from upstream bugs.
+fn retry_after_ms(resp: &reqwest::Response, attempt: u32) -> u64 {
+    let header_secs = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    match header_secs {
+        Some(s) if s > 0 => (s * 1000).min(60_000),
+        _ => (u64::from(attempt) + 1) * 2000,
+    }
+}
+
+/// Wrap a system prompt string into a single cache-marked text block so
+/// the whole tools+system prefix is eligible for Anthropic prompt caching.
+/// Blocks under the provider's minimum token threshold are processed
+/// without caching, so it's safe to always mark.
+fn build_system_blocks(system_text: Option<String>) -> Option<Vec<SystemBlock>> {
+    system_text.map(|text| {
+        vec![SystemBlock {
+            block_type: "text",
+            text,
+            cache_control: Some(CacheControl::EPHEMERAL),
+        }]
+    })
+}
+
+/// Convert tool definitions and mark the LAST tool with `cache_control`
+/// so the entire tool array lands in one cache segment.
+fn build_tools_with_cache(tools: &[ToolDefinition]) -> Vec<ApiTool> {
+    let mut api_tools: Vec<ApiTool> = tools
+        .iter()
+        .map(|t| ApiTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+            cache_control: None,
+        })
+        .collect();
+    if let Some(last) = api_tools.last_mut() {
+        last.cache_control = Some(CacheControl::EPHEMERAL);
+    }
+    api_tools
+}
+
 /// Ensure a `serde_json::Value` is a JSON object (dictionary).
 ///
 /// The Anthropic API requires `tool_use.input` to be a JSON object, never a
@@ -672,6 +749,8 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
         usage: TokenUsage {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,
+            cache_creation_input_tokens: api.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: api.usage.cache_read_input_tokens,
         },
     }
 }
@@ -704,6 +783,8 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         };
 
@@ -712,6 +793,81 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "web_search");
         assert_eq!(response.usage.total(), 150);
+    }
+
+    #[test]
+    fn test_convert_response_propagates_cache_tokens() {
+        let api_response = ApiResponse {
+            content: vec![ResponseContentBlock::Text {
+                text: "ok".into(),
+            }],
+            stop_reason: "end_turn".to_string(),
+            usage: ApiUsage {
+                input_tokens: 25,
+                output_tokens: 5,
+                cache_creation_input_tokens: 8000,
+                cache_read_input_tokens: 0,
+            },
+        };
+        let resp = convert_response(api_response);
+        assert_eq!(resp.usage.cache_creation_input_tokens, 8000);
+        assert_eq!(resp.usage.cache_read_input_tokens, 0);
+        assert_eq!(resp.usage.total_input_with_cache(), 25 + 8000);
+    }
+
+    #[test]
+    fn test_build_system_blocks_marks_cache() {
+        let blocks = build_system_blocks(Some("hello".into())).expect("some");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, "text");
+        assert!(blocks[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn test_build_system_blocks_none_passthrough() {
+        assert!(build_system_blocks(None).is_none());
+    }
+
+    #[test]
+    fn test_build_tools_with_cache_marks_last_only() {
+        let tools = vec![
+            ToolDefinition {
+                name: "a".into(),
+                description: "first".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            ToolDefinition {
+                name: "b".into(),
+                description: "last".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        ];
+        let api_tools = build_tools_with_cache(&tools);
+        assert_eq!(api_tools.len(), 2);
+        assert!(api_tools[0].cache_control.is_none());
+        assert!(api_tools[1].cache_control.is_some());
+    }
+
+    #[test]
+    fn test_build_tools_with_cache_empty() {
+        assert!(build_tools_with_cache(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_apirequest_serializes_system_as_blocks_with_cache() {
+        let req = ApiRequest {
+            model: "claude-sonnet-4".into(),
+            max_tokens: 100,
+            system: build_system_blocks(Some("sys prompt".into())),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            stream: false,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["system"][0]["type"], "text");
+        assert_eq!(v["system"][0]["text"], "sys prompt");
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

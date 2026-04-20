@@ -831,6 +831,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                 })
             }
@@ -986,6 +987,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 500,
                         output_tokens: 100,
+                        ..Default::default()
                     },
                 })
             }
@@ -1182,6 +1184,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 50,
                         output_tokens: 20,
+                        ..Default::default()
                     },
                 })
             }
