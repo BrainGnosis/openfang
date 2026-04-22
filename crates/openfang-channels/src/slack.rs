@@ -22,6 +22,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SLACK_MSG_LIMIT: usize = 3000;
 
+fn should_manage_assistant_status(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    is_group: bool,
+) -> bool {
+    !is_group && channel_id.starts_with('D') && thread_ts.is_some_and(|ts| !ts.is_empty())
+}
+
 /// Slack Socket Mode adapter.
 pub struct SlackAdapter {
     /// SECURITY: Tokens are zeroized on drop to prevent memory disclosure.
@@ -91,6 +99,55 @@ impl SlackAdapter {
         Ok(user_id)
     }
 
+    /// Set the AI-assistant typing-indicator-style status on a DM thread.
+    ///
+    /// Uses Slack's native `assistant.threads.setStatus` API (requires
+    /// `assistant:write` scope). Pass a non-empty `status` to show the
+    /// indicator; pass "" to clear it. Slack does NOT always auto-clear on
+    /// `chat.postMessage` in practice, so callers that set a status must
+    /// explicitly clear it after their reply lands. Failures are logged
+    /// but never propagated — this is a best-effort UX signal, never
+    /// block the main message path.
+    async fn assistant_threads_set_status(
+        client: &reqwest::Client,
+        bot_token: &str,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
+    ) {
+        let body = serde_json::json!({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "status": status,
+        });
+        let resp_result = client
+            .post(format!("{SLACK_API_BASE}/assistant.threads.setStatus"))
+            .header("Authorization", format!("Bearer {bot_token}"))
+            .json(&body)
+            .send()
+            .await;
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Slack assistant.threads.setStatus transport error: {e}");
+                return;
+            }
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Slack assistant.threads.setStatus decode error: {e}");
+                return;
+            }
+        };
+        if json["ok"].as_bool() != Some(true) {
+            let err = json["error"].as_str().unwrap_or("unknown");
+            // not_in_channel / not_allowed_token_type are expected for non-DM
+            // contexts; log at debug so they don't pollute production logs.
+            debug!("Slack assistant.threads.setStatus failed: {err}");
+        }
+    }
+
     /// Send a message to a Slack channel via chat.postMessage.
     async fn api_send_message(
         &self,
@@ -129,6 +186,25 @@ impl SlackAdapter {
                 warn!("Slack chat.postMessage failed: {err}");
             }
         }
+
+        // Clear the AI-assistant "is thinking…" status on DM threads. The
+        // setStatus-on-receive path fires this indicator; Slack does not
+        // reliably auto-clear it when chat.postMessage lands, so we always
+        // send an explicit empty-status call after the reply posts. Gated
+        // on channel prefix 'D' (DMs only) since that's where we set it.
+        if should_manage_assistant_status(channel_id, thread_ts, false) {
+            if let Some(ts) = thread_ts {
+                Self::assistant_threads_set_status(
+                    &self.client,
+                    self.bot_token.as_str(),
+                    channel_id,
+                    ts,
+                    "",
+                )
+                .await;
+            }
+        }
+
         Ok(())
     }
 }
@@ -155,6 +231,7 @@ impl ChannelAdapter for SlackAdapter {
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
 
         let app_token = self.app_token.clone();
+        let bot_token = self.bot_token.clone();
         let bot_user_id = self.bot_user_id.clone();
         let allowed_channels = self.allowed_channels.clone();
         let client = self.client.clone();
@@ -303,6 +380,35 @@ impl ChannelAdapter for SlackAdapter {
                                     "Slack message from {}: {:?}",
                                     msg.sender.display_name, msg.content
                                 );
+                                // Fire the native AI-assistant "is typing…"-style
+                                // status on DM threads. Best-effort; cleared
+                                // explicitly in api_send_message after the
+                                // reply posts (Slack does not reliably
+                                // auto-clear on chat.postMessage). Only
+                                // attempted on 1:1 DMs (channel id starts with D)
+                                // since Slack only allows setStatus there.
+                                if should_manage_assistant_status(
+                                    &msg.sender.platform_id,
+                                    msg.thread_id.as_deref(),
+                                    msg.is_group,
+                                ) {
+                                    if let Some(ref tts) = msg.thread_id {
+                                        let client_cl = client.clone();
+                                        let bot_token_cl = bot_token.clone();
+                                        let channel_cl = msg.sender.platform_id.clone();
+                                        let tts_cl = tts.clone();
+                                        tokio::spawn(async move {
+                                            SlackAdapter::assistant_threads_set_status(
+                                                &client_cl,
+                                                bot_token_cl.as_str(),
+                                                &channel_cl,
+                                                &tts_cl,
+                                                "is thinking…",
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                }
                                 if tx.send(msg).await.is_err() {
                                     return;
                                 }
@@ -741,5 +847,22 @@ mod tests {
             false,
         );
         assert!(!adapter.unfurl_links);
+    }
+
+    #[test]
+    fn test_should_manage_assistant_status_for_dm_threads_only() {
+        assert!(should_manage_assistant_status(
+            "D123",
+            Some("1700000000.000100"),
+            false,
+        ));
+        assert!(!should_manage_assistant_status("C123", Some("1700000000.000100"), false));
+        assert!(!should_manage_assistant_status("D123", None, false));
+        assert!(!should_manage_assistant_status("D123", Some(""), false));
+        assert!(!should_manage_assistant_status(
+            "D123",
+            Some("1700000000.000100"),
+            true,
+        ));
     }
 }
